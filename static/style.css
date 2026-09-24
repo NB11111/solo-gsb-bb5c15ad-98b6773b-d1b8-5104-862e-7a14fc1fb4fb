@@ -224,6 +224,40 @@ button.small {
   font-weight: 600;
 }
 
+/* 错误行的倍数修正建议 */
+.suggestion-box {
+  background: #e9f2e4;
+  border: 1px solid #cfe0c6;
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  font-size: 0.9rem;
+  line-height: 1.8;
+}
+
+.suggestion-title {
+  font-weight: 600;
+  color: #2e6b2e;
+}
+
+.suggestion-text {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  background: #fff;
+  border: 1px solid #dce6d2;
+  border-radius: 4px;
+  padding: 4px 8px;
+  margin: 4px 0;
+  word-break: break-all;
+}
+
+.suggestion-produce {
+  color: #4c5c46;
+}
+
+.suggestion-apply {
+  margin-top: 6px;
+}
+
 /* 线材用量参数输入 */
 .yarn-field {
   border: 1px solid #c9c2b2;

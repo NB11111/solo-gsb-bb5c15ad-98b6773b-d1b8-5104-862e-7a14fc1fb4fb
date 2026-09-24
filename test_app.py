@@ -317,5 +317,163 @@ class TestValidateSizesApi(unittest.TestCase):
             self.assertNotIn('weight', s['rows'][0])
 
 
+class TestValidateSizesSuggestion(unittest.TestCase):
+    SIZES = [{'name': 'S', 'cast_on': 12},
+             {'name': 'M', 'cast_on': 16},
+             {'name': 'L', 'cast_on': 20}]
+
+    def setUp(self):
+        self.client = app.test_client()
+
+    def post(self, sizes, pattern):
+        return self.client.post('/api/validate-sizes', json={
+            'sizes': sizes,
+            'pattern': pattern,
+        }).get_json()
+
+    def test_size_repeat_single_entry_fix(self):
+        # 仅 L 多消耗 2 针：改 *{...} 的第 3 项 11→10，S/M 不受影响
+        data = self.post(self.SIZES, '(k2tog yo)*{6|8|11}')
+        self.assertFalse(data['ok'])
+        sug = data['suggestion']
+        self.assertIsNotNone(sug)
+        self.assertEqual(sug['line'], 1)
+        self.assertEqual(sug['instruction'], '(k2tog yo)*{6|8|11}')
+        self.assertEqual(sug['old'], '*{6|8|11}')
+        self.assertEqual(sug['replacement'], '*{6|8|10}')
+        self.assertEqual(sug['text'], '(k2tog yo)*{6|8|10}')
+        self.assertEqual(sug['consume'], [12, 16, 20])
+        self.assertEqual(sug['produce'], [12, 16, 20])
+        self.assertEqual(sug['changed'], 1)
+        self.assertEqual(sug['delta'], 1)
+        # start/end 精确指向原文中的倍数
+        self.assertEqual(
+            '(k2tog yo)*{6|8|11}'[sug['start']:sug['end']], '*{6|8|11}')
+
+    def test_fix_covers_all_sizes_errored_on_same_row(self):
+        # 同一行 M、L 都有差额：一条建议必须同时修好两者
+        data = self.post(self.SIZES, '(k2tog yo)*{6|7|9}')
+        sug = data['suggestion']
+        self.assertEqual(sug['replacement'], '*{6|8|10}')
+        self.assertEqual(sug['changed'], 2)
+        self.assertEqual(sug['delta'], 2)
+        self.assertEqual(sug['consume'], [12, 16, 20])
+        self.assertEqual(sug['produce'], [12, 16, 20])
+
+    def test_plain_repeat_fix_applies_to_every_size(self):
+        # 普通 *n：两个尺码必须反解出同一个新倍数；改动项数记为全部尺码数
+        sizes = [{'name': 'A', 'cast_on': 12}, {'name': 'B', 'cast_on': 12}]
+        data = self.post(sizes, '(k2tog yo)*7')
+        sug = data['suggestion']
+        self.assertEqual(sug['old'], '*7')
+        self.assertEqual(sug['replacement'], '*6')
+        self.assertEqual(sug['text'], '(k2tog yo)*6')
+        self.assertEqual(sug['produce'], [12, 12])
+        self.assertEqual(sug['changed'], 2)
+        self.assertEqual(sug['delta'], 2)
+
+    def test_plain_repeat_cannot_fix_when_sizes_disagree(self):
+        # S 需要 n=6，L 需要 n=10：普通 *n 无法同时满足
+        sizes = [{'name': 'S', 'cast_on': 12}, {'name': 'L', 'cast_on': 20}]
+        data = self.post(sizes, '(k2tog yo)*8')
+        self.assertIsNone(data['suggestion'])
+
+    def test_correct_size_is_not_broken(self):
+        # S 本来正确：按尺码倍数修复 L 时 S 的项保持 6 不变
+        sizes = [{'name': 'S', 'cast_on': 12}, {'name': 'L', 'cast_on': 20}]
+        data = self.post(sizes, '(k2tog yo)*{6|11}')
+        sug = data['suggestion']
+        self.assertEqual(sug['replacement'], '*{6|10}')
+        self.assertEqual(sug['changed'], 1)
+        self.assertEqual(sug['produce'], [12, 20])
+
+    def test_nested_repeat_fixed_arithmetically(self):
+        # ((k2tog yo)*3)*2 消耗 12，可用 16：内层 *3→*4 即可，外层无解
+        sizes = [{'name': 'S', 'cast_on': 16}]
+        data = self.post(sizes, '((k2tog yo)*3)*2')
+        sug = data['suggestion']
+        self.assertEqual(sug['old'], '*3')
+        self.assertEqual(sug['replacement'], '*4')
+        self.assertEqual(sug['text'], '((k2tog yo)*4)*2')
+        self.assertEqual(sug['consume'], [16])
+        self.assertEqual(sug['produce'], [16])
+
+    def test_no_multiplier_no_suggestion(self):
+        sizes = [{'name': 'S', 'cast_on': 5}]
+        data = self.post(sizes, 'k k k')
+        self.assertFalse(data['ok'])
+        self.assertIsNone(data['suggestion'])
+
+    def test_indivisible_shortfall_no_suggestion(self):
+        # (k2tog)*3 消耗 6，可用 5：5 不是 2 的整数倍，无正整数倍数可修
+        sizes = [{'name': 'S', 'cast_on': 5}]
+        data = self.post(sizes, '(k2tog)*3')
+        self.assertFalse(data['ok'])
+        self.assertIsNone(data['suggestion'])
+
+    def test_zero_multiplier_never_suggested(self):
+        # 可用 2 针：把 (k2tog)*3 反解为 0 次才能对上，违反正整数约束，无解
+        sizes = [{'name': 'S', 'cast_on': 2}]
+        data = self.post(sizes, 'k*2 (k2tog)*3')
+        self.assertIsNone(data['suggestion'])
+
+    def test_parse_error_row_has_no_suggestion(self):
+        data = self.post(self.SIZES, 'k*{12|16|20}\nssk')
+        self.assertIsNone(data['suggestion'])
+
+    def test_delta_outranks_position(self):
+        # 两个倍数都可修复且改动项数相同：倍数变化总量更小者胜出（位置更靠后）
+        sizes = [{'name': 'S', 'cast_on': 10}]
+        data = self.post(sizes, '(k)*2 (k2tog)*3')
+        sug = data['suggestion']
+        self.assertEqual(sug['text'], '(k)*2 (k2tog)*4')
+        self.assertEqual(sug['produce'], [6])
+
+    def test_position_tie_break(self):
+        # 改动项数与变化总量都相同：原文位置更靠前的胜出
+        sizes = [{'name': 'S', 'cast_on': 10}]
+        data = self.post(sizes, '(k2tog)*4 (k2tog)*3')
+        sug = data['suggestion']
+        self.assertEqual(sug['old'], '*4')
+        self.assertEqual(sug['replacement'], '*2')
+        self.assertEqual(sug['text'], '(k2tog)*2 (k2tog)*3')
+        self.assertEqual(sug['consume'], [10])
+
+    def test_first_error_row_gets_the_suggestion(self):
+        # 第 2 行 S 出错并给出建议；第 3 行 M 的错误不覆盖首条建议
+        sizes = [{'name': 'S', 'cast_on': 4}, {'name': 'M', 'cast_on': 4}]
+        pattern = 'k*{4|4}\nk*{3|4}\nk*{4|9}'
+        data = self.post(sizes, pattern)
+        sug = data['suggestion']
+        self.assertEqual(sug['line'], 2)
+        self.assertEqual(sug['text'], 'k*{4|4}')
+        self.assertEqual(sug['produce'], [4, 4])
+        self.assertEqual(data['sizes'][1]['error']['line'], 3)
+
+    def test_suggestion_null_when_all_valid(self):
+        data = self.post(self.SIZES, '(k2tog yo)*{6|8|10}')
+        self.assertTrue(data['ok'])
+        self.assertIsNone(data['suggestion'])
+
+    def test_huge_multiplier_suggestion_is_arithmetic(self):
+        sizes = [{'name': 'S', 'cast_on': 2000000000}]
+        data = self.post(sizes, '(k yo)*1000000000')
+        sug = data['suggestion']
+        self.assertEqual(sug['text'], '(k yo)*2000000000')
+        self.assertEqual(sug['produce'], [4000000000])
+
+    def test_existing_result_fields_unchanged(self):
+        data = self.post(self.SIZES, '(k2tog yo)*{6|8|11}')
+        self.assertFalse(data['ok'])
+        # 尺码错误对象仍是原有字段，行数与推算行为不变
+        m = data['sizes'][2]
+        self.assertFalse(m['ok'])
+        self.assertEqual(m['error']['type'], 'count')
+        self.assertEqual(m['error']['line'], 1)
+        self.assertEqual(m['error']['diff'], 2)
+        self.assertEqual(m['rows'], [])
+        self.assertEqual(m['final'], 20)
+
+
 if __name__ == '__main__':
     unittest.main()

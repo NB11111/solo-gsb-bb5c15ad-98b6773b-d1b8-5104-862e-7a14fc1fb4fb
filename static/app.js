@@ -152,11 +152,11 @@ function render(data) {
   }
 
   for (const size of data.sizes) {
-    sizesResults.appendChild(renderSizeCard(size));
+    sizesResults.appendChild(renderSizeCard(size, data.suggestion || null, data.sizes));
   }
 }
 
-function renderSizeCard(size) {
+function renderSizeCard(size, suggestion, allSizes) {
   const card = document.createElement('div');
   card.className = 'size-card';
 
@@ -179,6 +179,11 @@ function renderSizeCard(size) {
     errBox.className = 'error size-error';
     errBox.textContent = formatError(size.error);
     card.appendChild(errBox);
+
+    // 针数差额错误：在错误行下方显示倍数修正建议，支持一键替换后重新校验
+    if (suggestion && size.error.type === 'count' && size.error.line === suggestion.line) {
+      card.appendChild(buildSuggestionBox(suggestion, allSizes));
+    }
   }
 
   if (size.yarn) {
@@ -237,6 +242,42 @@ function formatError(err) {
     return '第 ' + err.line + ' 行' + kind + '（差额 ' + Math.abs(err.diff) + ' 针）：' + err.message;
   }
   return err.message;
+}
+
+function buildSuggestionBox(suggestion, allSizes) {
+  const box = document.createElement('div');
+  box.className = 'suggestion-box';
+
+  const title = document.createElement('div');
+  title.className = 'suggestion-title';
+  title.textContent = '修正建议：将第 ' + suggestion.line + ' 行的 ' +
+    suggestion.old + ' 改为 ' + suggestion.replacement +
+    '（第 ' + (suggestion.start + 1) + '–' + suggestion.end + ' 个字符）';
+  box.appendChild(title);
+
+  const code = document.createElement('div');
+  code.className = 'suggestion-text';
+  code.textContent = suggestion.text;
+  box.appendChild(code);
+
+  const produce = document.createElement('div');
+  produce.className = 'suggestion-produce';
+  produce.textContent = '替换后各尺码产出：' + allSizes.map((s, i) =>
+    s.name + ' ' + suggestion.produce[i] + ' 针').join('，');
+  box.appendChild(produce);
+
+  const applyBtn = document.createElement('button');
+  applyBtn.type = 'button';
+  applyBtn.className = 'small suggestion-apply';
+  applyBtn.textContent = '替换该行并重新校验';
+  applyBtn.addEventListener('click', () => {
+    const lines = patternInput.value.split('\n');
+    lines[suggestion.line - 1] = suggestion.text;
+    patternInput.value = lines.join('\n');
+    form.requestSubmit();  // 一键替换后立即重新校验
+  });
+  box.appendChild(applyBtn);
+  return box;
 }
 
 function buildRowsTable(rows, withYarn) {

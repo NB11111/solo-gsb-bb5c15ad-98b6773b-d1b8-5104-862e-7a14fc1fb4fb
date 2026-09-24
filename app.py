@@ -16,13 +16,24 @@ POST /api/validate-sizes  多尺码校验（可附带线材用量估算）
                   "waste_percent": 10, "grams_per_ball": 50}}
   响应: {
     "ok": true/false,
-    "sizes": [{"name", "cast_on", "ok", "rows", "error", "final", "yarn"?}, ...]
+    "sizes": [{"name", "cast_on", "ok", "rows", "error", "final", "yarn"?}, ...],
+    "suggestion": null | {"line", "instruction", "start", "end", "old",
+                          "replacement", "text", "consume", "produce",
+                          "changed", "delta"}
   }
   提供 yarn 时，每行额外返回该尺码截至该行的累计克重 "weight"，尺码结果
   额外包含:
     "yarn": {"raw_total", "with_waste", "balls", "partial", "complete"}
   尺码列表或线材参数非法时:
-    {"ok": false, "sizes": [], "error": {"type": "sizes"|"yarn", ...}}
+    {"ok": false, "sizes": [], "error": {"type": "sizes"|"yarn", ...},
+     "suggestion": null}
+
+倍数修正建议：某行可解析但至少一个尚在推算的尺码出现针数差额时，针对首个
+这样的行逐一尝试仅修改该行一个现有的 *n 或 *{...} 倍数，使本行所有尚在
+推算的尺码消耗量等于各自可用针数（倍数保持正整数，原本正确的尺码不受损；
+嵌套重复只做算术推导，不展开）。候选按“改动的尺码项数 → 倍数变化总量 →
+原文位置”升序排序，仅返回首条；无解、行无法解析或全部通过时为 null。
+建议仅作为 "suggestion" 附加在响应上，不改变原有结果字段。
 
 逐行推算规则：每个尺码独立地以上一行的产出作为下一行的可用针数；某尺码
 消耗与可用针数不一致（不足或超出）时，仅该尺码停止并记录行号与差额，
@@ -43,7 +54,13 @@ import re
 
 from flask import Flask, jsonify, render_template, request
 
-from stitch_parser import STITCH_NAMES, ParseError, parse_row, parse_row_details
+from stitch_parser import (
+    STITCH_NAMES,
+    ParseError,
+    parse_row,
+    parse_row_details,
+    parse_row_repeat_sites,
+)
 
 app = Flask(__name__)
 
@@ -177,6 +194,120 @@ def _count_error_obj(lineno, text, available, consume):
     }
 
 
+def _solve_repeat_site(site, consumes, produces, availables, actives, text):
+    """尝试仅修改 site 这一个倍数，使所有尚在推算的尺码消耗等于可用针数。
+
+    本行各尺码消耗 = base + mult × coef（coef = 被重复单元消耗 × 外层倍数之积，
+    base 为与本倍数无关的部分），据此纯算术反解新倍数；倍数必须为正整数，
+    已停止推算的尺码不参与约束（*{...} 中对应项保持原值），原本正确的尺码
+    因此不会被破坏。返回候选建议 dict；本倍数无法修复时返回 None。
+    """
+    num_sizes = len(site.mults)
+    coef_c = [u * o for u, o in zip(site.unit_consume, site.outer)]
+    base_c = [consumes[j] - site.mults[j] * coef_c[j] for j in range(num_sizes)]
+
+    if site.sized:
+        # *{a|b|c}：逐项反解，已停止的尺码保持原倍数
+        new_mults = list(site.mults)
+        for j in range(num_sizes):
+            if not actives[j]:
+                continue
+            rhs = availables[j] - base_c[j]
+            if coef_c[j] == 0:
+                if rhs != 0:
+                    return None  # 本倍数不影响该尺码消耗，无法修复其差额
+                continue
+            if rhs <= 0 or rhs % coef_c[j] != 0:
+                return None
+            new_mults[j] = rhs // coef_c[j]
+    else:
+        # 普通 *n 对所有尺码生效：各活动尺码必须反解出同一个正整数
+        new_n = None
+        for j in range(num_sizes):
+            if not actives[j]:
+                continue
+            rhs = availables[j] - base_c[j]
+            if coef_c[j] == 0:
+                if rhs != 0:
+                    return None
+                continue
+            if rhs <= 0 or rhs % coef_c[j] != 0:
+                return None
+            n_j = rhs // coef_c[j]
+            if new_n is None:
+                new_n = n_j
+            elif new_n != n_j:
+                return None
+        if new_n is None:
+            return None
+        new_mults = [new_n] * num_sizes
+
+    changed = sum(1 for j in range(num_sizes) if new_mults[j] != site.mults[j])
+    if changed == 0:
+        return None  # 没有实际改动，说明本倍数不是差额来源
+    delta = sum(abs(new_mults[j] - site.mults[j]) for j in range(num_sizes))
+
+    coef_p = [u * o for u, o in zip(site.unit_produce, site.outer)]
+    base_p = [produces[j] - site.mults[j] * coef_p[j] for j in range(num_sizes)]
+    new_consume = [base_c[j] + new_mults[j] * coef_c[j] for j in range(num_sizes)]
+    new_produce = [base_p[j] + new_mults[j] * coef_p[j] for j in range(num_sizes)]
+
+    if site.sized:
+        replacement = "*{" + "|".join(str(m) for m in new_mults) + "}"
+    else:
+        replacement = "*" + str(new_mults[0])
+    return {
+        "start": site.start,
+        "end": site.end,
+        "old": text[site.start:site.end],
+        "replacement": replacement,
+        "text": text[:site.start] + replacement + text[site.end:],
+        "consume": new_consume,
+        "produce": new_produce,
+        "changed": changed,
+        "delta": delta,
+    }
+
+
+def _suggest_multiplier_fix(lineno, text, states):
+    """为首个出现针数差额的行构造倍数修正建议（仅改该行一个现有倍数）。
+
+    候选须让本行所有尚在推算的尺码消耗等于各自可用针数、倍数为正整数、
+    原本正确的尺码不受影响；按（改动的尺码项数, 倍数变化总量, 原文位置）
+    升序取首条返回。行无法解析或无解时返回 None。
+    """
+    num_sizes = len(states)
+    try:
+        consumes, produces, sites = parse_row_repeat_sites(text, num_sizes)
+    except ParseError:
+        return None
+    availables = [st["available"] for st in states]
+    actives = [st["active"] for st in states]
+    candidates = []
+    for site in sites:
+        candidate = _solve_repeat_site(
+            site, consumes, produces, availables, actives, text)
+        if candidate is not None:
+            candidates.append(candidate)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (c["changed"], c["delta"], c["start"]))
+    best = candidates[0]
+    return {
+        "line": lineno,
+        "instruction": text,
+        "start": best["start"],
+        "end": best["end"],
+        "old": best["old"],
+        "replacement": best["replacement"],
+        "text": best["text"],
+        "consume": best["consume"],
+        "produce": best["produce"],
+        "changed": best["changed"],
+        "delta": best["delta"],
+    }
+
+
 @app.get("/")
 def index():
     return render_template("index.html")
@@ -239,6 +370,7 @@ def validate_sizes():
             "ok": False,
             "sizes": [],
             "error": {"line": None, "type": "sizes", "message": err},
+            "suggestion": None,
         })
 
     yarn, err = _parse_yarn(data.get("yarn"))
@@ -247,6 +379,7 @@ def validate_sizes():
             "ok": False,
             "sizes": [],
             "error": {"line": None, "type": "yarn", "message": err},
+            "suggestion": None,
         })
 
     pattern = data.get("pattern", "")
@@ -264,6 +397,7 @@ def validate_sizes():
         "raw_weight": 0.0 if yarn is not None else None,
     } for s in sizes]
 
+    suggestion = None
     for lineno, raw_line in enumerate(pattern.splitlines(), 1):
         if not any(st["active"] for st in states):
             break  # 所有尺码都已停止，后续行不再推算
@@ -280,6 +414,11 @@ def validate_sizes():
                     st["error"] = error
                     st["active"] = False
             break
+        if suggestion is None and any(
+                st["active"] and consumes[i] != st["available"]
+                for i, st in enumerate(states)):
+            # 首个出现针数差额的行：尝试仅改一个倍数修复所有尚在推算的尺码
+            suggestion = _suggest_multiplier_fix(lineno, text, states)
         for i, st in enumerate(states):
             if not st["active"]:
                 continue
@@ -321,6 +460,7 @@ def validate_sizes():
     return jsonify({
         "ok": all(s["ok"] for s in result_sizes),
         "sizes": result_sizes,
+        "suggestion": suggestion,
     })
 
 
