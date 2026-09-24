@@ -16,7 +16,8 @@ POST /api/validate-sizes  多尺码校验（可附带线材用量估算）
                   "waste_percent": 10, "grams_per_ball": 50}}
   响应: {
     "ok": true/false,
-    "sizes": [{"name", "cast_on", "ok", "rows", "error", "final", "yarn"?}, ...]
+    "sizes": [{"name", "cast_on", "ok", "rows", "error", "final", "yarn"?}, ...],
+    "suggestion": null | {"line", "char", "old", "new", "instruction", "produces"}
   }
   提供 yarn 时，每行额外返回该尺码截至该行的累计克重 "weight"，尺码结果
   额外包含:
@@ -35,6 +36,13 @@ final 为最后一行有效推算后的针数（全部通过时即最终针数�
 （partial=true）；语法错误同样导致全部尺码的用量为部分估算。含损耗
 总量 = 原始总量 ×(1+waste_percent/100)，线团数为其除以每团克重后
 向上取整。
+
+倍数修正建议：某行可解析但至少一个尚在推算的尺码针数不符时，针对首个
+这样的行逐一尝试“仅改该行一个现有的 *n 或 *{...} 倍数”（嵌套重复只按
+算术推导，不展开）。建议行须让本行所有尚在推算的尺码消耗恰好等于各自
+可用针数，倍数保持正整数，原本正确的尺码不受影响。候选按（改动的尺码
+项数, 倍数变化总量, 原文位置）升序排列，首条放入响应顶层的 "suggestion"
+（不改变原有结果字段）；无解或没有针数差额时 suggestion 为 null。
 """
 
 import math
@@ -43,7 +51,13 @@ import re
 
 from flask import Flask, jsonify, render_template, request
 
-from stitch_parser import STITCH_NAMES, ParseError, parse_row, parse_row_details
+from stitch_parser import (
+    STITCH_NAMES,
+    ParseError,
+    parse_row,
+    parse_row_details,
+    suggest_row_fix,
+)
 
 app = Flask(__name__)
 
@@ -264,6 +278,7 @@ def validate_sizes():
         "raw_weight": 0.0 if yarn is not None else None,
     } for s in sizes]
 
+    first_count_error = None  # (行号, 原文, 各尺码可用针数)：首个针数差额行
     for lineno, raw_line in enumerate(pattern.splitlines(), 1):
         if not any(st["active"] for st in states):
             break  # 所有尺码都已停止，后续行不再推算
@@ -280,6 +295,12 @@ def validate_sizes():
                     st["error"] = error
                     st["active"] = False
             break
+        if first_count_error is None and any(
+                st["active"] and consumes[i] != st["available"]
+                for i, st in enumerate(states)):
+            # 记录首个针数差额行的现场，供事后推导倍数修正建议
+            first_count_error = (lineno, text, [
+                st["available"] if st["active"] else None for st in states])
         for i, st in enumerate(states):
             if not st["active"]:
                 continue
@@ -305,6 +326,20 @@ def validate_sizes():
             st["rows"].append(row)
             st["available"] = produce
 
+    suggestion = None
+    if first_count_error is not None:
+        err_line, err_text, availables = first_count_error
+        fix = suggest_row_fix(err_text, availables)
+        if fix is not None:
+            suggestion = {
+                "line": err_line,
+                "char": fix["char"],
+                "old": fix["old"],
+                "new": fix["new"],
+                "instruction": fix["instruction"],
+                "produces": fix["produces"],
+            }
+
     result_sizes = []
     for st in states:
         result = {
@@ -321,6 +356,7 @@ def validate_sizes():
     return jsonify({
         "ok": all(s["ok"] for s in result_sizes),
         "sizes": result_sizes,
+        "suggestion": suggestion,
     })
 
 

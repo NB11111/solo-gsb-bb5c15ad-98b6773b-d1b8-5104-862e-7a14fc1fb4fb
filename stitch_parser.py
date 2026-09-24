@@ -15,6 +15,11 @@
 除消耗/产出针数外，解析器还可返回每种记号（k/p/yo/k2tog）在每行中每个
 尺码的实际出现次数（parse_row_details / parse_row_stitch_counts），供线材
 用量按“记号次数 × 单记号克重”累计。
+
+suggest_row_fix 为“可解析但至少一个尺码针数不符”的行推导修正建议：整行
+消耗关于任何一个倍数都是线性的，用 *1、*2 两次试算即可推出“基数 + 系数
+× 倍数”（嵌套重复同样只做算术推导，不展开），进而解出让各尺码消耗恰好
+等于可用针数的正整数倍数。
 """
 
 import re
@@ -245,3 +250,123 @@ def parse_row(text):
     """单尺码解析：返回 (消耗针数, 产出针数)。非法输入抛出 ParseError。"""
     consumes, produces, _tallies = parse_row_details(text, 1)
     return consumes[0], produces[0]
+
+
+def _repeat_sites(text, num_sizes):
+    """列出行中每个倍数的位置与各尺码当前值（仅供已确认可解析的行使用）。
+
+    返回 [(star_pos, end, values), ...]：star_pos 为 '*' 在原文中的下标，
+    end 为整个倍数文本（从 '*' 起）的结束下标（开区间）；values 为长度
+    num_sizes 的各尺码当前倍数（普通 *n 展开为 num_sizes 个相同值）。
+    """
+    sites = []
+    tokens = _tokenize(text)
+    i = 0
+    while i < len(tokens):
+        kind, _val, pos = tokens[i]
+        if kind != 'STAR':
+            i += 1
+            continue
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        if nxt is not None and nxt[0] == 'NUM':
+            sites.append((pos, nxt[2] + len(nxt[1]), [int(nxt[1])] * num_sizes))
+            i += 2
+            continue
+        if nxt is not None and nxt[0] == 'LBRACE':
+            values = []
+            j = i + 1
+            while j < len(tokens) and tokens[j][0] != 'RBRACE':
+                if tokens[j][0] == 'NUM':
+                    values.append(int(tokens[j][1]))
+                j += 1
+            end = tokens[j][2] + 1 if j < len(tokens) else len(text)
+            sites.append((pos, end, values))
+            i = j + 1
+            continue
+        i += 1  # 孤立的 '*' 只出现在不可解析的行中，调用方已排除
+    return sites
+
+
+def _try_multiplier_fix(text, site, availables, num_sizes):
+    """尝试仅改 site 处的一个倍数让各尺码消耗等于可用针数。
+
+    成功返回 ((改动的尺码项数, 倍数变化总量, 原文位置), 候选 dict)，否则
+    返回 None。整行消耗关于该倍数是线性的：用 *1、*2 各试算一次即可推出
+    “基数 + 系数 × 倍数”，嵌套重复只参与算术推导，不展开。
+    """
+    star_pos, end, current = site
+    try:
+        c1 = parse_row_sizes(text[:star_pos] + '*1' + text[end:], num_sizes)[0]
+        c2 = parse_row_sizes(text[:star_pos] + '*2' + text[end:], num_sizes)[0]
+    except ParseError:
+        return None
+    new_values = []
+    changed = 0
+    delta = 0
+    for i in range(num_sizes):
+        coeff = c2[i] - c1[i]  # 该倍数每 +1，此尺码整行消耗的增量
+        base = c1[i] - coeff   # 行内其余部分的消耗
+        target = availables[i]
+        if target is None:
+            new = current[i]   # 已停止推算的尺码：保持原倍数
+        elif coeff == 0:
+            if base != target:
+                return None    # 此倍数不影响该尺码，差额无法借此修正
+            new = current[i]
+        else:
+            rest = target - base
+            if rest <= 0 or rest % coeff != 0:
+                return None    # 倍数必须为正整数
+            new = rest // coeff
+        new_values.append(new)
+        if new != current[i]:
+            changed += 1
+            delta += abs(new - current[i])
+    if changed == 0:
+        return None            # 没有实际改动
+    if all(v == new_values[0] for v in new_values):
+        replacement = '*{}'.format(new_values[0])
+    else:
+        replacement = '*{' + '|'.join(str(v) for v in new_values) + '}'
+    new_text = text[:star_pos] + replacement + text[end:]
+    try:
+        consumes, produces = parse_row_sizes(new_text, num_sizes)
+    except ParseError:
+        return None
+    for i in range(num_sizes):
+        if availables[i] is not None and consumes[i] != availables[i]:
+            return None
+    candidate = {
+        'char': star_pos + 1,  # '*' 的字符位置（从 1 计）
+        'old': text[star_pos:end],
+        'new': replacement,
+        'instruction': new_text,
+        'produces': produces,
+    }
+    return (changed, delta, star_pos), candidate
+
+
+def suggest_row_fix(text, availables):
+    """为可解析但至少一个尺码针数不符的行寻找“仅改一个倍数”的修正建议。
+
+    availables 为各尺码当前可用针数；None 表示该尺码已停止推算，不参与
+    约束且倍数保持原值。候选必须让所有参与约束的尺码消耗恰好等于可用
+    针数（原本正确的尺码不受影响），倍数保持正整数。多个候选按
+    （改动的尺码项数, 倍数变化总量, 原文位置）升序排列，返回首条：
+      {"char", "old", "new", "instruction", "produces"}
+    各尺码新倍数相同时建议写作普通 *n，否则写作 *{a|b|c}。
+    无解（或行本身不可解析）时返回 None。
+    """
+    num_sizes = len(availables)
+    if num_sizes < 1:
+        raise ValueError("availables 不能为空")
+    try:
+        parse_row_details(text, num_sizes)
+    except ParseError:
+        return None
+    best = None
+    for site in _repeat_sites(text, num_sizes):
+        result = _try_multiplier_fix(text, site, availables, num_sizes)
+        if result is not None and (best is None or result[0] < best[0]):
+            best = result
+    return best[1] if best is not None else None

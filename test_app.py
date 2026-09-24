@@ -317,5 +317,108 @@ class TestValidateSizesApi(unittest.TestCase):
             self.assertNotIn('weight', s['rows'][0])
 
 
+class TestValidateSizesSuggestion(unittest.TestCase):
+    SIZES = [{'name': 'S', 'cast_on': 12},
+             {'name': 'M', 'cast_on': 16},
+             {'name': 'L', 'cast_on': 20}]
+
+    def setUp(self):
+        self.client = app.test_client()
+
+    def post(self, sizes, pattern, yarn=None):
+        payload = {'sizes': sizes, 'pattern': pattern}
+        if yarn is not None:
+            payload['yarn'] = yarn
+        return self.client.post('/api/validate-sizes', json=payload).get_json()
+
+    def test_count_error_yields_fix_suggestion(self):
+        # 第 1 行 L 需要 *10 而非 *9；S/M 原本正确，不能受影响
+        pattern = '(k2tog yo)*{6|8|9}\np*{12|16|20}'
+        data = self.post(self.SIZES, pattern)
+        self.assertFalse(data['ok'])
+        sug = data['suggestion']
+        self.assertIsNotNone(sug)
+        self.assertEqual(sug['line'], 1)
+        self.assertEqual(sug['char'], 11)  # '*' 是第 11 个字符
+        self.assertEqual(sug['old'], '*{6|8|9}')
+        self.assertEqual(sug['new'], '*{6|8|10}')
+        self.assertEqual(sug['instruction'], '(k2tog yo)*{6|8|10}')
+        self.assertEqual(sug['produces'], [12, 16, 20])
+        # 原有结果字段不受影响
+        self.assertEqual(data['sizes'][2]['error']['type'], 'count')
+        self.assertEqual(data['sizes'][2]['error']['diff'], -2)
+        self.assertEqual(len(data['sizes'][0]['rows']), 2)
+
+    def test_applied_suggestion_passes_validation(self):
+        pattern = '(k2tog yo)*{6|8|9}\np*{12|16|20}'
+        data = self.post(self.SIZES, pattern)
+        sug = data['suggestion']
+        lines = pattern.split('\n')
+        lines[sug['line'] - 1] = sug['instruction']
+        fixed = self.post(self.SIZES, '\n'.join(lines))
+        self.assertTrue(fixed['ok'])
+        self.assertIsNone(fixed['suggestion'])
+        self.assertEqual([s['final'] for s in fixed['sizes']], [12, 16, 20])
+
+    def test_no_error_gives_null_suggestion(self):
+        data = self.post(self.SIZES, '(k2tog yo)*{6|8|10}\np*{12|16|20}')
+        self.assertTrue(data['ok'])
+        self.assertIsNone(data['suggestion'])
+
+    def test_unsolvable_row_gives_null_suggestion(self):
+        # (k2tog)*n 消耗总是偶数，7 针无法通过改倍数修正
+        sizes = [{'name': 'S', 'cast_on': 7}]
+        data = self.post(sizes, '(k2tog)*3')
+        self.assertFalse(data['ok'])
+        self.assertIsNone(data['suggestion'])
+        self.assertEqual(data['sizes'][0]['error']['type'], 'count')
+
+    def test_parse_error_gives_null_suggestion(self):
+        data = self.post(self.SIZES, 'k*{12|16|20}\nssk')
+        self.assertFalse(data['ok'])
+        self.assertIsNone(data['suggestion'])
+
+    def test_suggestion_targets_first_error_row(self):
+        # 第 2 行 M 差额（首个错误行）；建议只改第 2 行的倍数
+        sizes = [{'name': 'S', 'cast_on': 4},
+                 {'name': 'M', 'cast_on': 6},
+                 {'name': 'L', 'cast_on': 8}]
+        pattern = 'k*{4|6|8}\n(k yo)*{4|5|8}\nk*{8|1|16}'
+        data = self.post(sizes, pattern)
+        sug = data['suggestion']
+        self.assertIsNotNone(sug)
+        self.assertEqual(sug['line'], 2)
+        self.assertEqual(sug['instruction'], '(k yo)*{4|6|8}')
+        self.assertEqual(sug['produces'], [8, 12, 16])
+        # 应用后 M 推进到第 3 行才出错，并给出新的建议
+        lines = pattern.split('\n')
+        lines[sug['line'] - 1] = sug['instruction']
+        fixed = self.post(sizes, '\n'.join(lines))
+        s, m, l = fixed['sizes']
+        self.assertTrue(s['ok'])
+        self.assertTrue(l['ok'])
+        self.assertFalse(m['ok'])
+        self.assertEqual(m['error']['line'], 3)
+        self.assertEqual(fixed['suggestion']['line'], 3)
+        self.assertEqual(fixed['suggestion']['instruction'], 'k*{8|12|16}')
+
+    def test_suggestion_with_yarn_request(self):
+        # 线材用量估算与建议互不影响
+        yarn = {'k': 0.5, 'p': 0.5, 'yo': 0.2, 'k2tog': 1.0,
+                'waste_percent': 10, 'grams_per_ball': 50}
+        data = self.post(self.SIZES, '(k2tog yo)*{6|8|9}\np*{12|16|20}', yarn)
+        self.assertFalse(data['ok'])
+        self.assertEqual(data['suggestion']['instruction'], '(k2tog yo)*{6|8|10}')
+        self.assertTrue(data['sizes'][2]['yarn']['partial'])
+        self.assertFalse(data['sizes'][0]['yarn']['partial'])
+
+    def test_single_size_api_has_no_suggestion(self):
+        data = self.client.post('/api/validate', json={
+            'cast_on': 7, 'pattern': '(k2tog)*3',
+        }).get_json()
+        self.assertFalse(data['ok'])
+        self.assertNotIn('suggestion', data)
+
+
 if __name__ == '__main__':
     unittest.main()

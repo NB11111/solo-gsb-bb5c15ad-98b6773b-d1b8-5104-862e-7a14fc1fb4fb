@@ -151,12 +151,14 @@ function render(data) {
     summaryBox.className = 'error';
   }
 
+  const suggestion = data.suggestion || null;
+  const sizeNames = data.sizes.map((s) => s.name);
   for (const size of data.sizes) {
-    sizesResults.appendChild(renderSizeCard(size));
+    sizesResults.appendChild(renderSizeCard(size, suggestion, sizeNames));
   }
 }
 
-function renderSizeCard(size) {
+function renderSizeCard(size, suggestion, sizeNames) {
   const card = document.createElement('div');
   card.className = 'size-card';
 
@@ -179,6 +181,10 @@ function renderSizeCard(size) {
     errBox.className = 'error size-error';
     errBox.textContent = formatError(size.error);
     card.appendChild(errBox);
+    // 针数差额行附有修正建议时，在错误行处展示并支持一键替换
+    if (suggestion && size.error.type === 'count' && size.error.line === suggestion.line) {
+      card.appendChild(buildSuggestionBox(suggestion, sizeNames));
+    }
   }
 
   if (size.yarn) {
@@ -237,6 +243,48 @@ function formatError(err) {
     return '第 ' + err.line + ' 行' + kind + '（差额 ' + Math.abs(err.diff) + ' 针）：' + err.message;
   }
   return err.message;
+}
+
+function buildSuggestionBox(sug, sizeNames) {
+  const box = document.createElement('div');
+  box.className = 'suggestion-box';
+
+  const title = document.createElement('div');
+  title.className = 'suggestion-title';
+  title.textContent = '倍数修正建议（第 ' + sug.line + ' 行，第 ' + sug.char + ' 个字符起）';
+  box.appendChild(title);
+
+  const lines = [
+    '将 ' + sug.old + ' 改为 ' + sug.new,
+    '替换后：' + sug.instruction,
+    '各尺码产出：' + sug.produces
+      .map((p, i) => (sizeNames[i] || '尺码' + (i + 1)) + ' ' + p + ' 针')
+      .join('，'),
+  ];
+  for (const text of lines) {
+    const div = document.createElement('div');
+    div.className = 'suggestion-text';
+    div.textContent = text;
+    box.appendChild(div);
+  }
+
+  const applyBtn = document.createElement('button');
+  applyBtn.type = 'button';
+  applyBtn.className = 'small apply-suggestion';
+  applyBtn.textContent = '应用并重新校验';
+  applyBtn.addEventListener('click', () => applySuggestion(sug));
+  box.appendChild(applyBtn);
+  return box;
+}
+
+function applySuggestion(sug) {
+  const lines = patternInput.value.split('\n');
+  if (sug.line < 1 || sug.line > lines.length) {
+    return;
+  }
+  lines[sug.line - 1] = sug.instruction;
+  patternInput.value = lines.join('\n');
+  form.requestSubmit();  // 替换后自动重新校验
 }
 
 function buildRowsTable(rows, withYarn) {

@@ -224,6 +224,31 @@ button.small {
   font-weight: 600;
 }
 
+/* 错误行的倍数修正建议 */
+.suggestion-box {
+  background: #e9f2e4;
+  border: 1px solid #cbdec2;
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  font-size: 0.9rem;
+  line-height: 1.8;
+}
+
+.suggestion-title {
+  font-weight: 600;
+  color: #2e6b2e;
+}
+
+.suggestion-text {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+
+.apply-suggestion {
+  margin-top: 6px;
+  background: #6b8f5e;
+}
+
 /* 线材用量参数输入 */
 .yarn-field {
   border: 1px solid #c9c2b2;

@@ -6,6 +6,7 @@ from stitch_parser import (
     parse_row_details,
     parse_row_sizes,
     parse_row_stitch_counts,
+    suggest_row_fix,
 )
 
 
@@ -167,6 +168,77 @@ class TestParseRowStitchCounts(unittest.TestCase):
     def test_invalid_row_raises(self):
         with self.assertRaises(ParseError):
             parse_row_stitch_counts('ssk', 1)
+
+
+class TestSuggestRowFix(unittest.TestCase):
+    def test_size_repeat_single_item_fix(self):
+        # L 需要 10 而非 9；S/M 原本正确，不能受影响
+        sug = suggest_row_fix('(k2tog yo)*{6|8|9}', [12, 16, 20])
+        self.assertIsNotNone(sug)
+        self.assertEqual(sug['instruction'], '(k2tog yo)*{6|8|10}')
+        self.assertEqual(sug['old'], '*{6|8|9}')
+        self.assertEqual(sug['new'], '*{6|8|10}')
+        self.assertEqual(sug['char'], 11)  # '*' 是第 11 个字符
+        self.assertEqual(sug['produces'], [12, 16, 20])
+
+    def test_plain_repeat_same_value_for_all_sizes(self):
+        sug = suggest_row_fix('k*12', [10, 10])
+        self.assertEqual(sug['instruction'], 'k*10')
+        self.assertEqual(sug['old'], '*12')
+        self.assertEqual(sug['new'], '*10')
+
+    def test_plain_repeat_becomes_size_repeat(self):
+        # 各尺码需要不同倍数时，普通 *n 改写为 *{a|b|c}
+        sug = suggest_row_fix('(k2tog yo)*6', [12, 14, 16])
+        self.assertEqual(sug['instruction'], '(k2tog yo)*{6|7|8}')
+        self.assertEqual(sug['produces'], [12, 14, 16])
+
+    def test_size_repeat_collapses_to_plain_when_uniform(self):
+        # 两个尺码都需要 3：*{2|2} 改写为 *3；另一处倍数无法整除，不可行
+        sug = suggest_row_fix('(k2tog)*{3|4} k*{2|2}', [9, 11])
+        self.assertEqual(sug['instruction'], '(k2tog)*{3|4} k*3')
+        self.assertEqual(sug['produces'], [6, 7])
+
+    def test_nested_repeat_fixed_by_arithmetic(self):
+        # ((k yo)*2 k2tog)*3 消耗 12；可用 15 时内层 *2 -> *3（每组多 1 针，外层 *3）
+        sug = suggest_row_fix('((k yo)*2 k2tog)*3', [15])
+        self.assertEqual(sug['instruction'], '((k yo)*3 k2tog)*3')
+        self.assertEqual(sug['produces'], [21])
+
+    def test_no_solution_when_not_divisible(self):
+        # (k2tog)*n 消耗总是偶数，可用 7 针无法通过改倍数修正
+        self.assertIsNone(suggest_row_fix('(k2tog)*3', [7]))
+
+    def test_no_solution_when_multiplier_would_be_non_positive(self):
+        # k*2 之外的基数已是 6 针，可用 3 针：倍数只能为非正数，无解
+        self.assertIsNone(suggest_row_fix('k*2 (k2tog)*3', [3]))
+
+    def test_zero_consume_repeat_cannot_fix(self):
+        # (yo)*n 不消耗针数，无法用它修正差额；只能改 k*3
+        sug = suggest_row_fix('(yo)*5 k*3', [4])
+        self.assertEqual(sug['instruction'], '(yo)*5 k*4')
+
+    def test_inactive_sizes_keep_current_values(self):
+        # M 已停止推算（None）：倍数保持 8，只修 L 的 9 -> 10
+        sug = suggest_row_fix('(k2tog yo)*{6|8|9}', [12, None, 20])
+        self.assertEqual(sug['instruction'], '(k2tog yo)*{6|8|10}')
+
+    def test_smallest_delta_wins(self):
+        # 两个位置都可修：(k2tog)*2 -> *3（变化 1）优于 k*2 -> k*4（变化 2）
+        sug = suggest_row_fix('(k2tog)*2 k*2', [8])
+        self.assertEqual(sug['instruction'], '(k2tog)*3 k*2')
+
+    def test_position_breaks_tie(self):
+        # 两个 k*2 都需改为 k*4（变化量相同），取原文位置靠前者
+        sug = suggest_row_fix('k*2 k*2', [6])
+        self.assertEqual(sug['instruction'], 'k*4 k*2')
+
+    def test_unparseable_row_returns_none(self):
+        self.assertIsNone(suggest_row_fix('ssk', [4]))
+
+    def test_huge_multiplier_not_expanded(self):
+        sug = suggest_row_fix('(k yo)*1000000000', [1000000001])
+        self.assertEqual(sug['instruction'], '(k yo)*1000000001')
 
 
 if __name__ == '__main__':
